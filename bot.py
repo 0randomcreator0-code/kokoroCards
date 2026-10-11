@@ -103,12 +103,23 @@ CARD_CATEGORIES = {
     ],
 }
 
-user_data = {}
-card_counter = 1000
-locked_cards = set()
-trade_offers = {}
-auctions = {}
-auction_counter = 1
+RARITIES = {
+    "common": {"weight": 50, "value": 50},
+    "uncommon": {"weight": 30, "value": 150},
+    "rare": {"weight": 15, "value": 500},
+    "epic": {"weight": 4, "value": 1500},
+    "legendary": {"weight": 1, "value": 5000},
+}
+
+CATEGORY_MULTIPLIERS = {
+    "anime": 1.0,
+    "cartoon": 0.8,
+    "kpop": 1.2,
+    "kdrama": 1.1,
+    "cdrama": 1.0,
+    "jdrama": 1.0,
+    "manhwa": 1.3,
+}
 
 
 def normalize_category(value: str):
@@ -130,6 +141,18 @@ def normalize_category(value: str):
     return aliases.get(cleaned, cleaned)
 
 
+def get_card_value(rarity: str, category: str) -> int:
+    base_value = RARITIES.get(rarity, {}).get("value", 50)
+    multiplier = CATEGORY_MULTIPLIERS.get(category, 1.0)
+    return int(base_value * multiplier)
+
+
+def generate_rarity() -> str:
+    weights = [v["weight"] for v in RARITIES.values()]
+    rarities_list = list(RARITIES.keys())
+    return random.choices(rarities_list, weights=weights, k=1)[0]
+
+
 def connect_db():
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
@@ -138,6 +161,7 @@ def connect_db():
 
 def init_db():
     conn = connect_db()
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -146,6 +170,7 @@ def init_db():
         )
         """
     )
+
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS cards (
@@ -153,102 +178,63 @@ def init_db():
             owner_id TEXT NOT NULL,
             name TEXT NOT NULL,
             category TEXT NOT NULL,
+            rarity TEXT NOT NULL,
+            value INTEGER NOT NULL,
             locked INTEGER NOT NULL DEFAULT 0,
-            obtained_at TEXT NOT NULL
+            obtained_at TEXT NOT NULL,
+            FOREIGN KEY (owner_id) REFERENCES users(user_id)
         )
         """
     )
-    conn.commit()
-    conn.close()
-
-
-def load_user_data():
-    global card_counter
-
-    user_data.clear()
-    conn = connect_db()
-
-    for row in conn.execute("SELECT user_id, tokens FROM users ORDER BY user_id"):
-        user_id = int(row["user_id"])
-        user_data[user_id] = {"cards": {}, "tokens": int(row["tokens"]), "inventory": []}
-
-    for row in conn.execute("SELECT * FROM cards ORDER BY card_id"):
-        owner_id = int(row["owner_id"])
-        user_data.setdefault(owner_id, {"cards": {}, "tokens": 1000, "inventory": []})
-        card_id = int(row["card_id"])
-        card_entry = {
-            "id": card_id,
-            "name": row["name"],
-            "category": row["category"],
-            "locked": bool(row["locked"]),
-            "obtained_at": row["obtained_at"],
-        }
-        user_data[owner_id]["cards"][card_id] = card_entry
-        user_data[owner_id]["inventory"].append(card_id)
-        if card_id >= card_counter:
-            card_counter = card_id + 1
-
-    conn.close()
-
-
-def save_user_data(user_id):
-    conn = connect_db()
-    uid = str(user_id)
-    user = user_data.get(user_id)
-
-    if not user:
-        conn.close()
-        return
 
     conn.execute(
-        "INSERT INTO users (user_id, tokens) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tokens = excluded.tokens",
-        (uid, int(user["tokens"])),
-    )
-    conn.execute("DELETE FROM cards WHERE owner_id = ?", (uid,))
-
-    for card_id in sorted(user["cards"].keys()):
-        card = user["cards"][card_id]
-        conn.execute(
-            "INSERT INTO cards (card_id, owner_id, name, category, locked, obtained_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                int(card_id),
-                uid,
-                card["name"],
-                card["category"],
-                1 if card["locked"] else 0,
-                card["obtained_at"],
-            ),
+        """
+        CREATE TABLE IF NOT EXISTS trades (
+            trade_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_user_id TEXT NOT NULL,
+            to_user_id TEXT NOT NULL,
+            cards_offered TEXT NOT NULL,
+            tokens_offered INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY (from_user_id) REFERENCES users(user_id),
+            FOREIGN KEY (to_user_id) REFERENCES users(user_id)
         )
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auctions (
+            auction_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT NOT NULL,
+            cards_ids TEXT NOT NULL,
+            starting_price INTEGER NOT NULL,
+            current_bid INTEGER NOT NULL,
+            highest_bidder_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            created_at TEXT NOT NULL,
+            ended_at TEXT,
+            FOREIGN KEY (owner_id) REFERENCES users(user_id),
+            FOREIGN KEY (highest_bidder_id) REFERENCES users(user_id)
+        )
+        """
+    )
 
     conn.commit()
     conn.close()
 
 
 def initialize_user(user_id):
-    user_id = int(user_id)
-    if user_id not in user_data:
-        user_data[user_id] = {"cards": {}, "tokens": 1000, "inventory": []}
-
+    user_id = str(user_id)
     conn = connect_db()
     conn.execute(
         "INSERT OR IGNORE INTO users (user_id, tokens) VALUES (?, ?)",
-        (str(user_id), 1000),
+        (user_id, 1000),
     )
     conn.commit()
     conn.close()
-
-    if user_id in user_data and not user_data[user_id]["cards"]:
-        save_user_data(user_id)
-
-
-def generate_card_id():
-    global card_counter
-    card_counter += 1
-    return card_counter
-
-
-init_db()
-load_user_data()
 
 
 class MyBot(commands.Bot):
@@ -273,7 +259,7 @@ async def on_ready():
 
 # ==================== CARD COMMANDS ====================
 
-@bot.command(name="card", aliases=["c", "C"], help="Recommend a card from a category or choose a random one.")
+@bot.command(name="card", aliases=["c", "C"], help="Get a random card from a category or choose a random one.")
 async def card(ctx, category: str = "random"):
     initialize_user(ctx.author.id)
 
@@ -287,28 +273,49 @@ async def card(ctx, category: str = "random"):
             return
 
     card_name = random.choice(CARD_CATEGORIES[selected_category])
-    card_id = generate_card_id()
+    rarity = generate_rarity()
+    card_value = get_card_value(rarity, selected_category)
 
-    card_data = {
-        "id": card_id,
-        "name": card_name,
-        "category": selected_category,
-        "locked": False,
-        "obtained_at": datetime.now().isoformat(),
+    conn = connect_db()
+    conn.execute(
+        """
+        INSERT INTO cards (owner_id, name, category, rarity, value, locked, obtained_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            str(ctx.author.id),
+            card_name,
+            selected_category,
+            rarity,
+            card_value,
+            0,
+            datetime.now().isoformat(),
+        ),
+    )
+    conn.commit()
+
+    result = conn.execute("SELECT last_insert_rowid() as card_id").fetchone()
+    card_id = result["card_id"]
+    conn.close()
+
+    rarity_emoji = {
+        "common": "⚪",
+        "uncommon": "🟢",
+        "rare": "🔵",
+        "epic": "🟣",
+        "legendary": "🟡",
     }
-
-    user_data[ctx.author.id]["cards"][card_id] = card_data
-    user_data[ctx.author.id]["inventory"].append(card_id)
-    save_user_data(ctx.author.id)
 
     embed = discord.Embed(
         title=f"🎴 {selected_category.upper()} Card",
-        description=f"Recommended pick: **{card_name}**",
+        description=f"**{card_name}**",
         color=discord.Color.magenta(),
         timestamp=datetime.now(),
     )
     embed.add_field(name="Category", value=selected_category.title(), inline=True)
     embed.add_field(name="Card ID", value=f"`{card_id}`", inline=True)
+    embed.add_field(name="Rarity", value=f"{rarity_emoji.get(rarity, '')} {rarity.title()}", inline=True)
+    embed.add_field(name="Value", value=f"{card_value} 🪙", inline=True)
     embed.add_field(name="Status", value="🔓 Unlocked", inline=True)
     await ctx.send(embed=embed)
 
@@ -319,19 +326,25 @@ async def card(ctx, category: str = "random"):
 async def lock_card(ctx, card_id: int):
     initialize_user(ctx.author.id)
 
-    if card_id not in user_data[ctx.author.id]["cards"]:
-        await ctx.send(f"❌ You don't own card ID `{card_id}`")
-        return
+    conn = connect_db()
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ? AND owner_id = ?",
+        (card_id, str(ctx.author.id)),
+    ).fetchone()
 
-    card = user_data[ctx.author.id]["cards"][card_id]
+    if not card:
+        await ctx.send(f"❌ You don't own card ID `{card_id}`")
+        conn.close()
+        return
 
     if card["locked"]:
         await ctx.send(f"❌ Card ID `{card_id}` is already locked")
+        conn.close()
         return
 
-    card["locked"] = True
-    locked_cards.add(card_id)
-    save_user_data(ctx.author.id)
+    conn.execute("UPDATE cards SET locked = 1 WHERE card_id = ?", (card_id,))
+    conn.commit()
+    conn.close()
 
     embed = discord.Embed(
         title="🔒 Card Locked",
@@ -346,19 +359,25 @@ async def lock_card(ctx, card_id: int):
 async def unlock_card(ctx, card_id: int):
     initialize_user(ctx.author.id)
 
-    if card_id not in user_data[ctx.author.id]["cards"]:
-        await ctx.send(f"❌ You don't own card ID `{card_id}`")
-        return
+    conn = connect_db()
+    card = conn.execute(
+        "SELECT * FROM cards WHERE card_id = ? AND owner_id = ?",
+        (card_id, str(ctx.author.id)),
+    ).fetchone()
 
-    card = user_data[ctx.author.id]["cards"][card_id]
+    if not card:
+        await ctx.send(f"❌ You don't own card ID `{card_id}`")
+        conn.close()
+        return
 
     if not card["locked"]:
         await ctx.send(f"❌ Card ID `{card_id}` is already unlocked")
+        conn.close()
         return
 
-    card["locked"] = False
-    locked_cards.discard(card_id)
-    save_user_data(ctx.author.id)
+    conn.execute("UPDATE cards SET locked = 0 WHERE card_id = ?", (card_id,))
+    conn.commit()
+    conn.close()
 
     embed = discord.Embed(
         title="🔓 Card Unlocked",
@@ -415,28 +434,43 @@ async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
         await ctx.send("❌ Invalid card ID format. Use: `k!tc @user 1001, 1002`")
         return
 
-    for cid in card_ids:
-        if cid not in user_data[ctx.author.id]["cards"]:
-            await ctx.send(f"❌ You don't own card ID `{cid}`")
-            return
+    conn = connect_db()
 
-        card = user_data[ctx.author.id]["cards"][cid]
-        if card["locked"]:
-            await ctx.send(f"❌ Card ID `{cid}` is locked and cannot be traded. Use `k!unlock {cid}` first.")
-            return
-
-    if tokens_amount > user_data[ctx.author.id]["tokens"]:
-        await ctx.send(f"❌ You only have {user_data[ctx.author.id]['tokens']} tokens")
+    user = conn.execute("SELECT tokens FROM users WHERE user_id = ?", (str(ctx.author.id),)).fetchone()
+    if tokens_amount > user["tokens"]:
+        await ctx.send(f"❌ You only have {user['tokens']} tokens")
+        conn.close()
         return
 
-    trade_id = len(trade_offers)
-    trade_offers[trade_id] = {
-        "from_user": ctx.author.id,
-        "to_user": target_user.id,
-        "cards": card_ids,
-        "tokens": tokens_amount,
-        "status": "pending",
-    }
+    for cid in card_ids:
+        card = conn.execute(
+            "SELECT * FROM cards WHERE card_id = ? AND owner_id = ?",
+            (cid, str(ctx.author.id)),
+        ).fetchone()
+
+        if not card:
+            await ctx.send(f"❌ You don't own card ID `{cid}`")
+            conn.close()
+            return
+
+        if card["locked"]:
+            await ctx.send(f"❌ Card ID `{cid}` is locked and cannot be traded. Use `k!unlock {cid}` first.")
+            conn.close()
+            return
+
+    cards_str = ",".join(str(cid) for cid in card_ids)
+    conn.execute(
+        """
+        INSERT INTO trades (from_user_id, to_user_id, cards_offered, tokens_offered, status, created_at)
+        VALUES (?, ?, ?, ?, 'pending', ?)
+        """,
+        (str(ctx.author.id), str(target_user.id), cards_str, tokens_amount, datetime.now().isoformat()),
+    )
+    conn.commit()
+
+    result = conn.execute("SELECT last_insert_rowid() as trade_id").fetchone()
+    trade_id = result["trade_id"]
+    conn.close()
 
     embed = discord.Embed(
         title="💳 Trade Offer Created",
@@ -454,47 +488,112 @@ async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
 async def accept_trade(ctx, trade_id: int):
     initialize_user(ctx.author.id)
 
-    if trade_id not in trade_offers:
+    conn = connect_db()
+    trade = conn.execute(
+        "SELECT * FROM trades WHERE trade_id = ?",
+        (trade_id,),
+    ).fetchone()
+
+    if not trade:
         await ctx.send(f"❌ Trade ID `{trade_id}` not found")
+        conn.close()
         return
 
-    trade = trade_offers[trade_id]
-
-    if trade["to_user"] != ctx.author.id:
+    if trade["to_user_id"] != str(ctx.author.id):
         await ctx.send("❌ This trade offer is not for you")
+        conn.close()
         return
 
-    from_user_id = trade["from_user"]
-    to_user_id = trade["to_user"]
+    if trade["status"] != "pending":
+        await ctx.send(f"❌ This trade is already {trade['status']}")
+        conn.close()
+        return
 
-    for card_id in trade["cards"]:
-        card = user_data[from_user_id]["cards"].pop(card_id)
-        user_data[to_user_id]["cards"][card_id] = card
-        user_data[from_user_id]["inventory"].remove(card_id)
-        user_data[to_user_id]["inventory"].append(card_id)
+    from_user_id = trade["from_user_id"]
+    to_user_id = trade["to_user_id"]
+    card_ids = [int(cid) for cid in trade["cards_offered"].split(",")]
+    tokens_offered = trade["tokens_offered"]
 
-    user_data[from_user_id]["tokens"] -= trade["tokens"]
-    user_data[to_user_id]["tokens"] += trade["tokens"]
-    save_user_data(from_user_id)
-    save_user_data(to_user_id)
+    try:
+        for card_id in card_ids:
+            conn.execute(
+                "UPDATE cards SET owner_id = ? WHERE card_id = ?",
+                (to_user_id, card_id),
+            )
 
-    trade["status"] = "completed"
+        conn.execute(
+            "UPDATE users SET tokens = tokens - ? WHERE user_id = ?",
+            (tokens_offered, from_user_id),
+        )
+        conn.execute(
+            "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+            (tokens_offered, to_user_id),
+        )
+
+        conn.execute(
+            "UPDATE trades SET status = 'completed', completed_at = ? WHERE trade_id = ?",
+            (datetime.now().isoformat(), trade_id),
+        )
+
+        conn.commit()
+
+        embed = discord.Embed(
+            title="✅ Trade Completed",
+            description="Trade offer has been accepted and executed",
+            color=discord.Color.green(),
+        )
+        await ctx.send(embed=embed)
+    except Exception as e:
+        conn.rollback()
+        await ctx.send(f"❌ Error completing trade: {str(e)}")
+    finally:
+        conn.close()
+
+
+@bot.command(name="trades", help="View your pending trades")
+async def view_trades(ctx):
+    initialize_user(ctx.author.id)
+
+    conn = connect_db()
+    trades = conn.execute(
+        "SELECT * FROM trades WHERE (from_user_id = ? OR to_user_id = ?) AND status = 'pending' ORDER BY trade_id DESC",
+        (str(ctx.author.id), str(ctx.author.id)),
+    ).fetchall()
+    conn.close()
+
+    if not trades:
+        await ctx.send("❌ No pending trades")
+        return
 
     embed = discord.Embed(
-        title="✅ Trade Completed",
-        description="Trade offer has been accepted and executed",
-        color=discord.Color.green(),
+        title="💳 Your Pending Trades",
+        color=discord.Color.blue(),
     )
+
+    for trade in trades[:10]:
+        direction = "📤 Sent" if trade["from_user_id"] == str(ctx.author.id) else "📥 Received"
+        embed.add_field(
+            name=f"Trade #{trade['trade_id']} {direction}",
+            value=f"Cards: {trade['cards_offered']}\nTokens: {trade['tokens_offered']} 🪙",
+            inline=False,
+        )
+
     await ctx.send(embed=embed)
 
 
 # ==================== AUCTION COMMANDS ====================
 
-@bot.command(name="as", aliases=["auctionsearch"], help="Search for auctions with specific cards")
+@bot.command(name="as", aliases=["auctionsearch"], help="Search for auctions")
 async def auction_search(ctx, *, category: str = "all"):
     initialize_user(ctx.author.id)
 
-    if not auctions:
+    conn = connect_db()
+    auctions_data = conn.execute(
+        "SELECT * FROM auctions WHERE status = 'active' ORDER BY auction_id DESC LIMIT 20"
+    ).fetchall()
+    conn.close()
+
+    if not auctions_data:
         await ctx.send("❌ No active auctions available")
         return
 
@@ -506,15 +605,26 @@ async def auction_search(ctx, *, category: str = "all"):
     )
 
     auction_count = 0
-    for auction_id, auction in auctions.items():
-        if category.lower() == "all" or any(normalize_category(category) == card.get("category") for card in auction["cards"]):
-            card_names = ", ".join([card["name"] for card in auction["cards"]])
-            embed.add_field(
-                name=f"Auction #{auction_id}",
-                value=f"Cards: {card_names}\nStarting Price: {auction['starting_price']} 🪙\nCurrent Bid: {auction['current_bid']} 🪙",
-                inline=False,
-            )
-            auction_count += 1
+    for auction in auctions_data:
+        card_ids = [int(cid) for cid in auction["cards_ids"].split(",")]
+
+        conn = connect_db()
+        cards = conn.execute(
+            f"SELECT * FROM cards WHERE card_id IN ({','.join('?' * len(card_ids))})",
+            card_ids,
+        ).fetchall()
+        conn.close()
+
+        if category.lower() != "all" and not any(normalize_category(category) == card["category"] for card in cards):
+            continue
+
+        card_names = ", ".join([card["name"] for card in cards])
+        embed.add_field(
+            name=f"Auction #{auction['auction_id']}",
+            value=f"Cards: {card_names}\nCurrent Bid: {auction['current_bid']} 🪙",
+            inline=False,
+        )
+        auction_count += 1
 
     if auction_count == 0:
         await ctx.send(f"❌ No auctions found for category: {category}")
@@ -528,11 +638,23 @@ async def auction_search(ctx, *, category: str = "all"):
 async def auction_info(ctx, auction_id: int):
     initialize_user(ctx.author.id)
 
-    if auction_id not in auctions:
+    conn = connect_db()
+    auction = conn.execute(
+        "SELECT * FROM auctions WHERE auction_id = ?",
+        (auction_id,),
+    ).fetchone()
+
+    if not auction:
         await ctx.send(f"❌ Auction ID `{auction_id}` not found")
+        conn.close()
         return
 
-    auction = auctions[auction_id]
+    card_ids = [int(cid) for cid in auction["cards_ids"].split(",")]
+    cards = conn.execute(
+        f"SELECT * FROM cards WHERE card_id IN ({','.join('?' * len(card_ids))})",
+        card_ids,
+    ).fetchall()
+    conn.close()
 
     embed = discord.Embed(
         title=f"🏆 Auction #{auction_id} Details",
@@ -540,14 +662,17 @@ async def auction_info(ctx, auction_id: int):
         timestamp=datetime.now(),
     )
 
-    card_names = "\n".join([f"• {card['name']} (ID: `{card['id']}`)" for card in auction["cards"]])
+    card_names = "\n".join([f"• {card['name']} (ID: `{card['card_id']}`, Rarity: {card['rarity'].title()})" for card in cards])
     embed.add_field(name="Cards in Auction", value=card_names, inline=False)
     embed.add_field(name="Starting Price", value=f"{auction['starting_price']} 🪙", inline=True)
     embed.add_field(name="Current Bid", value=f"{auction['current_bid']} 🪙", inline=True)
 
-    if auction["highest_bidder"]:
-        highest_bidder = await bot.fetch_user(auction["highest_bidder"])
-        embed.add_field(name="Highest Bidder", value=highest_bidder.mention, inline=False)
+    if auction["highest_bidder_id"]:
+        try:
+            highest_bidder = await bot.fetch_user(int(auction["highest_bidder_id"]))
+            embed.add_field(name="Highest Bidder", value=highest_bidder.mention, inline=False)
+        except:
+            pass
 
     embed.add_field(name="Place a Bid", value=f"Use `k!bid {auction_id} <amount>`", inline=False)
     await ctx.send(embed=embed)
@@ -567,42 +692,49 @@ async def create_auction(ctx, starting_price: int, *, card_ids_str: str):
         await ctx.send("❌ Invalid card ID format")
         return
 
-    cards = []
+    conn = connect_db()
+
     for card_id in card_ids:
-        if card_id not in user_data[ctx.author.id]["cards"]:
+        card = conn.execute(
+            "SELECT * FROM cards WHERE card_id = ? AND owner_id = ?",
+            (card_id, str(ctx.author.id)),
+        ).fetchone()
+
+        if not card:
             await ctx.send(f"❌ You don't own card ID `{card_id}`")
+            conn.close()
             return
 
-        card = user_data[ctx.author.id]["cards"][card_id]
         if card["locked"]:
             await ctx.send(f"❌ Card ID `{card_id}` is locked")
+            conn.close()
             return
 
-        cards.append(card)
+    cards_str = ",".join(str(cid) for cid in card_ids)
+    conn.execute(
+        """
+        INSERT INTO auctions (owner_id, cards_ids, starting_price, current_bid, status, created_at)
+        VALUES (?, ?, ?, ?, 'active', ?)
+        """,
+        (str(ctx.author.id), cards_str, starting_price, starting_price, datetime.now().isoformat()),
+    )
+    conn.commit()
 
-    global auction_counter
-    auction_id = auction_counter
-    auction_counter += 1
+    result = conn.execute("SELECT last_insert_rowid() as auction_id").fetchone()
+    auction_id = result["auction_id"]
 
-    auctions[auction_id] = {
-        "owner": ctx.author.id,
-        "cards": cards,
-        "starting_price": starting_price,
-        "current_bid": starting_price,
-        "highest_bidder": None,
-    }
-
-    for card_id in card_ids:
-        user_data[ctx.author.id]["cards"].pop(card_id)
-        user_data[ctx.author.id]["inventory"].remove(card_id)
-    save_user_data(ctx.author.id)
+    cards = conn.execute(
+        f"SELECT * FROM cards WHERE card_id IN ({','.join('?' * len(card_ids))})",
+        card_ids,
+    ).fetchall()
+    conn.close()
 
     embed = discord.Embed(
         title="🏆 Auction Created",
         description=f"Auction #{auction_id} is now live",
         color=discord.Color.green(),
     )
-    card_names = "\n".join([f"• {card['name']}" for card in cards])
+    card_names = "\n".join([f"• {card['name']} ({card['rarity'].title()})" for card in cards])
     embed.add_field(name="Cards", value=card_names, inline=False)
     embed.add_field(name="Starting Price", value=f"{starting_price} 🪙", inline=False)
     embed.add_field(name="Bid Command", value=f"`k!bid {auction_id} <amount>`", inline=False)
@@ -613,22 +745,43 @@ async def create_auction(ctx, starting_price: int, *, card_ids_str: str):
 async def place_bid(ctx, auction_id: int, bid_amount: int):
     initialize_user(ctx.author.id)
 
-    if auction_id not in auctions:
+    conn = connect_db()
+    auction = conn.execute(
+        "SELECT * FROM auctions WHERE auction_id = ?",
+        (auction_id,),
+    ).fetchone()
+
+    if not auction:
         await ctx.send(f"❌ Auction ID `{auction_id}` not found")
+        conn.close()
         return
 
-    auction = auctions[auction_id]
+    if auction["status"] != "active":
+        await ctx.send(f"❌ Auction is {auction['status']}")
+        conn.close()
+        return
 
     if bid_amount <= auction["current_bid"]:
         await ctx.send(f"❌ Bid must be higher than current bid ({auction['current_bid']} 🪙)")
+        conn.close()
         return
 
-    if bid_amount > user_data[ctx.author.id]["tokens"]:
-        await ctx.send(f"❌ You only have {user_data[ctx.author.id]['tokens']} tokens")
+    user = conn.execute(
+        "SELECT tokens FROM users WHERE user_id = ?",
+        (str(ctx.author.id),),
+    ).fetchone()
+
+    if bid_amount > user["tokens"]:
+        await ctx.send(f"❌ You only have {user['tokens']} tokens")
+        conn.close()
         return
 
-    auction["current_bid"] = bid_amount
-    auction["highest_bidder"] = ctx.author.id
+    conn.execute(
+        "UPDATE auctions SET current_bid = ?, highest_bidder_id = ? WHERE auction_id = ?",
+        (bid_amount, str(ctx.author.id), auction_id),
+    )
+    conn.commit()
+    conn.close()
 
     embed = discord.Embed(
         title=f"💰 Bid Placed on Auction #{auction_id}",
@@ -643,15 +796,26 @@ async def place_bid(ctx, auction_id: int, bid_amount: int):
 @bot.command(name="token", aliases=["t", "T"], help="Check your token balance")
 async def check_tokens(ctx):
     initialize_user(ctx.author.id)
-    tokens = user_data[ctx.author.id]["tokens"]
+
+    conn = connect_db()
+    user = conn.execute(
+        "SELECT tokens FROM users WHERE user_id = ?",
+        (str(ctx.author.id),),
+    ).fetchone()
+
+    card_count = conn.execute(
+        "SELECT COUNT(*) as count FROM cards WHERE owner_id = ?",
+        (str(ctx.author.id),),
+    ).fetchone()
+    conn.close()
 
     embed = discord.Embed(
         title="🪙 Token Balance",
         description=f"{ctx.author.mention}'s Balance",
         color=discord.Color.yellow(),
     )
-    embed.add_field(name="Tokens", value=f"{tokens} 🪙", inline=True)
-    embed.add_field(name="Card Count", value=f"{len(user_data[ctx.author.id]['inventory'])} cards", inline=True)
+    embed.add_field(name="Tokens", value=f"{user['tokens']} 🪙", inline=True)
+    embed.add_field(name="Card Count", value=f"{card_count['count']} cards", inline=True)
     await ctx.send(embed=embed)
 
 
@@ -662,15 +826,26 @@ async def give_tokens(ctx, user: discord.Member, amount: int):
         return
 
     initialize_user(user.id)
-    user_data[user.id]["tokens"] += amount
-    save_user_data(user.id)
+
+    conn = connect_db()
+    conn.execute(
+        "UPDATE users SET tokens = tokens + ? WHERE user_id = ?",
+        (amount, str(user.id)),
+    )
+    conn.commit()
+
+    user_data = conn.execute(
+        "SELECT tokens FROM users WHERE user_id = ?",
+        (str(user.id),),
+    ).fetchone()
+    conn.close()
 
     embed = discord.Embed(
         title="💰 Tokens Added",
         description=f"{amount} 🪙 added to {user.mention}'s balance",
         color=discord.Color.green(),
     )
-    embed.add_field(name="New Balance", value=f"{user_data[user.id]['tokens']} 🪙", inline=False)
+    embed.add_field(name="New Balance", value=f"{user_data['tokens']} 🪙", inline=False)
     await ctx.send(embed=embed)
 
 
@@ -681,10 +856,24 @@ async def inventory(ctx, user: discord.Member = None):
     target_user = user or ctx.author
     initialize_user(target_user.id)
 
-    cards = user_data[target_user.id]["cards"]
-    tokens = user_data[target_user.id]["tokens"]
+    conn = connect_db()
+    cards = conn.execute(
+        "SELECT * FROM cards WHERE owner_id = ? ORDER BY card_id DESC LIMIT 10",
+        (str(target_user.id),),
+    ).fetchall()
 
-    if not cards:
+    card_count = conn.execute(
+        "SELECT COUNT(*) as count FROM cards WHERE owner_id = ?",
+        (str(target_user.id),),
+    ).fetchone()
+
+    user_data = conn.execute(
+        "SELECT tokens FROM users WHERE user_id = ?",
+        (str(target_user.id),),
+    ).fetchone()
+    conn.close()
+
+    if card_count["count"] == 0:
         embed = discord.Embed(
             title=f"📦 {target_user.name}'s Inventory",
             description="No cards yet. Use `k!card` to get started!",
@@ -693,22 +882,30 @@ async def inventory(ctx, user: discord.Member = None):
         await ctx.send(embed=embed)
         return
 
+    rarity_emoji = {
+        "common": "⚪",
+        "uncommon": "🟢",
+        "rare": "🔵",
+        "epic": "🟣",
+        "legendary": "🟡",
+    }
+
     embed = discord.Embed(
         title=f"📦 {target_user.name}'s Inventory",
-        description=f"Total Cards: {len(cards)} | Tokens: {tokens} 🪙",
+        description=f"Total Cards: {card_count['count']} | Tokens: {user_data['tokens']} 🪙",
         color=discord.Color.blue(),
     )
 
-    for card_id, card in list(cards.items())[:10]:
+    for card in cards:
         lock_status = "🔒 Locked" if card["locked"] else "🔓 Unlocked"
         embed.add_field(
-            name=f"{card['name']} (ID: `{card_id}`)",
-            value=f"Category: {card['category'].title()}\nStatus: {lock_status}",
+            name=f"{card['name']} (ID: `{card['card_id']}`)",
+            value=f"Category: {card['category'].title()}\nRarity: {rarity_emoji.get(card['rarity'], '')} {card['rarity'].title()}\nValue: {card['value']} 🪙\nStatus: {lock_status}",
             inline=False,
         )
 
-    if len(cards) > 10:
-        embed.set_footer(text=f"Showing 10 of {len(cards)} cards")
+    if card_count["count"] > 10:
+        embed.set_footer(text=f"Showing 10 of {card_count['count']} cards. Use k!inv for more details.")
 
     await ctx.send(embed=embed)
 
@@ -737,7 +934,7 @@ async def help_command(interaction: discord.Interaction):
 
     embed.add_field(name="🎴 Card Commands", value="", inline=False)
     for cmd, desc in [
-        ("k!card [category]", "Get a random card (anime, cartoon, kpop, kdrama, cdrama, jdrama, manhwa)"),
+        ("k!card [category]", "Get a random card with rarity (anime, cartoon, kpop, kdrama, cdrama, jdrama, manhwa)"),
         ("k!c", "Alias for k!card"),
     ]:
         embed.add_field(name=cmd, value=desc, inline=False)
@@ -753,6 +950,7 @@ async def help_command(interaction: discord.Interaction):
     for cmd, desc in [
         ("k!tc @user <card_ids> [tokens]", "Offer a trade to another user"),
         ("k!accept_trade <trade_id>", "Accept a trade offer"),
+        ("k!trades", "View your pending trades"),
     ]:
         embed.add_field(name=cmd, value=desc, inline=False)
 
@@ -1031,4 +1229,5 @@ async def clear(ctx, amount: int = 5):
 
 
 if __name__ == "__main__":
+    init_db()
     bot.run(TOKEN)
