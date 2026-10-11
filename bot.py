@@ -1,15 +1,17 @@
 import os
+import sqlite3
+import random
+from datetime import datetime, timedelta
+
 import discord
 from discord import app_commands
 from discord.ext import commands
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
-import random
-import json
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-PREFIX = "k!"  # Custom prefix for prefix commands
+PREFIX = "k!"
+DB_PATH = os.path.join(os.getcwd(), "kokoro_cards.db")
 
 if not TOKEN:
     raise ValueError("DISCORD_TOKEN is not set. Add it to your .env file.")
@@ -101,12 +103,11 @@ CARD_CATEGORIES = {
     ],
 }
 
-# In-memory user data storage
-user_data = {}  # {user_id: {"cards": {card_id: {...}}, "tokens": int, "inventory": []}}
-card_counter = 1000  # Card ID counter
-locked_cards = set()  # Set of locked card IDs
-trade_offers = {}  # {offer_id: {"from_user": user_id, "to_user": user_id, "cards": [...], "tokens": amount}}
-auctions = {}  # {auction_id: {"owner": user_id, "cards": [...], "starting_price": amount, "current_bid": amount, "highest_bidder": user_id}}
+user_data = {}
+card_counter = 1000
+locked_cards = set()
+trade_offers = {}
+auctions = {}
 auction_counter = 1
 
 
@@ -129,21 +130,125 @@ def normalize_category(value: str):
     return aliases.get(cleaned, cleaned)
 
 
-def initialize_user(user_id):
-    """Initialize user data if not exists"""
-    if user_id not in user_data:
-        user_data[user_id] = {
-            "cards": {},
-            "tokens": 1000,  # Starting tokens
-            "inventory": [],
+def connect_db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db():
+    conn = connect_db()
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id TEXT PRIMARY KEY,
+            tokens INTEGER NOT NULL DEFAULT 1000
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS cards (
+            card_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            owner_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            category TEXT NOT NULL,
+            locked INTEGER NOT NULL DEFAULT 0,
+            obtained_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_user_data():
+    global card_counter
+
+    user_data.clear()
+    conn = connect_db()
+
+    for row in conn.execute("SELECT user_id, tokens FROM users ORDER BY user_id"):
+        user_id = int(row["user_id"])
+        user_data[user_id] = {"cards": {}, "tokens": int(row["tokens"]), "inventory": []}
+
+    for row in conn.execute("SELECT * FROM cards ORDER BY card_id"):
+        owner_id = int(row["owner_id"])
+        user_data.setdefault(owner_id, {"cards": {}, "tokens": 1000, "inventory": []})
+        card_id = int(row["card_id"])
+        card_entry = {
+            "id": card_id,
+            "name": row["name"],
+            "category": row["category"],
+            "locked": bool(row["locked"]),
+            "obtained_at": row["obtained_at"],
         }
+        user_data[owner_id]["cards"][card_id] = card_entry
+        user_data[owner_id]["inventory"].append(card_id)
+        if card_id >= card_counter:
+            card_counter = card_id + 1
+
+    conn.close()
+
+
+def save_user_data(user_id):
+    conn = connect_db()
+    uid = str(user_id)
+    user = user_data.get(user_id)
+
+    if not user:
+        conn.close()
+        return
+
+    conn.execute(
+        "INSERT INTO users (user_id, tokens) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET tokens = excluded.tokens",
+        (uid, int(user["tokens"])),
+    )
+    conn.execute("DELETE FROM cards WHERE owner_id = ?", (uid,))
+
+    for card_id in sorted(user["cards"].keys()):
+        card = user["cards"][card_id]
+        conn.execute(
+            "INSERT INTO cards (card_id, owner_id, name, category, locked, obtained_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                int(card_id),
+                uid,
+                card["name"],
+                card["category"],
+                1 if card["locked"] else 0,
+                card["obtained_at"],
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def initialize_user(user_id):
+    user_id = int(user_id)
+    if user_id not in user_data:
+        user_data[user_id] = {"cards": {}, "tokens": 1000, "inventory": []}
+
+    conn = connect_db()
+    conn.execute(
+        "INSERT OR IGNORE INTO users (user_id, tokens) VALUES (?, ?)",
+        (str(user_id), 1000),
+    )
+    conn.commit()
+    conn.close()
+
+    if user_id in user_data and not user_data[user_id]["cards"]:
+        save_user_data(user_id)
 
 
 def generate_card_id():
-    """Generate unique card ID"""
     global card_counter
     card_counter += 1
     return card_counter
+
+
+init_db()
+load_user_data()
 
 
 class MyBot(commands.Bot):
@@ -184,7 +289,6 @@ async def card(ctx, category: str = "random"):
     card_name = random.choice(CARD_CATEGORIES[selected_category])
     card_id = generate_card_id()
 
-    # Store card in user inventory
     card_data = {
         "id": card_id,
         "name": card_name,
@@ -195,6 +299,7 @@ async def card(ctx, category: str = "random"):
 
     user_data[ctx.author.id]["cards"][card_id] = card_data
     user_data[ctx.author.id]["inventory"].append(card_id)
+    save_user_data(ctx.author.id)
 
     embed = discord.Embed(
         title=f"🎴 {selected_category.upper()} Card",
@@ -226,6 +331,7 @@ async def lock_card(ctx, card_id: int):
 
     card["locked"] = True
     locked_cards.add(card_id)
+    save_user_data(ctx.author.id)
 
     embed = discord.Embed(
         title="🔒 Card Locked",
@@ -252,6 +358,7 @@ async def unlock_card(ctx, card_id: int):
 
     card["locked"] = False
     locked_cards.discard(card_id)
+    save_user_data(ctx.author.id)
 
     embed = discord.Embed(
         title="🔓 Card Unlocked",
@@ -274,7 +381,6 @@ async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
         return
 
     if details is None:
-        # Show trade info format
         embed = discord.Embed(
             title="💳 Trade Card Command",
             description="Usage: `k!tc @user card_id1, card_id2 [tokens]`",
@@ -293,7 +399,6 @@ async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
         await ctx.send(embed=embed)
         return
 
-    # Parse trade details
     parts = details.split()
     card_ids_str = parts[0]
     tokens_amount = 0
@@ -310,7 +415,6 @@ async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
         await ctx.send("❌ Invalid card ID format. Use: `k!tc @user 1001, 1002`")
         return
 
-    # Validate cards
     for cid in card_ids:
         if cid not in user_data[ctx.author.id]["cards"]:
             await ctx.send(f"❌ You don't own card ID `{cid}`")
@@ -321,12 +425,10 @@ async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
             await ctx.send(f"❌ Card ID `{cid}` is locked and cannot be traded. Use `k!unlock {cid}` first.")
             return
 
-    # Validate tokens
     if tokens_amount > user_data[ctx.author.id]["tokens"]:
         await ctx.send(f"❌ You only have {user_data[ctx.author.id]['tokens']} tokens")
         return
 
-    # Create trade offer
     trade_id = len(trade_offers)
     trade_offers[trade_id] = {
         "from_user": ctx.author.id,
@@ -362,20 +464,19 @@ async def accept_trade(ctx, trade_id: int):
         await ctx.send("❌ This trade offer is not for you")
         return
 
-    # Execute trade
     from_user_id = trade["from_user"]
     to_user_id = trade["to_user"]
 
-    # Transfer cards
     for card_id in trade["cards"]:
         card = user_data[from_user_id]["cards"].pop(card_id)
         user_data[to_user_id]["cards"][card_id] = card
         user_data[from_user_id]["inventory"].remove(card_id)
         user_data[to_user_id]["inventory"].append(card_id)
 
-    # Transfer tokens
     user_data[from_user_id]["tokens"] -= trade["tokens"]
     user_data[to_user_id]["tokens"] += trade["tokens"]
+    save_user_data(from_user_id)
+    save_user_data(to_user_id)
 
     trade["status"] = "completed"
 
@@ -491,10 +592,10 @@ async def create_auction(ctx, starting_price: int, *, card_ids_str: str):
         "highest_bidder": None,
     }
 
-    # Remove cards from user inventory
     for card_id in card_ids:
         user_data[ctx.author.id]["cards"].pop(card_id)
         user_data[ctx.author.id]["inventory"].remove(card_id)
+    save_user_data(ctx.author.id)
 
     embed = discord.Embed(
         title="🏆 Auction Created",
@@ -542,7 +643,6 @@ async def place_bid(ctx, auction_id: int, bid_amount: int):
 @bot.command(name="token", aliases=["t", "T"], help="Check your token balance")
 async def check_tokens(ctx):
     initialize_user(ctx.author.id)
-
     tokens = user_data[ctx.author.id]["tokens"]
 
     embed = discord.Embed(
@@ -557,13 +657,13 @@ async def check_tokens(ctx):
 
 @bot.command(name="give_tokens", help="Admin command to give tokens to a user")
 async def give_tokens(ctx, user: discord.Member, amount: int):
-    # This is an admin-only command for testing
     if not ctx.author.guild_permissions.administrator:
         await ctx.send("❌ Only administrators can use this command")
         return
 
     initialize_user(user.id)
     user_data[user.id]["tokens"] += amount
+    save_user_data(user.id)
 
     embed = discord.Embed(
         title="💰 Tokens Added",
@@ -599,7 +699,7 @@ async def inventory(ctx, user: discord.Member = None):
         color=discord.Color.blue(),
     )
 
-    for card_id, card in list(cards.items())[:10]:  # Show first 10 cards
+    for card_id, card in list(cards.items())[:10]:
         lock_status = "🔒 Locked" if card["locked"] else "🔓 Unlocked"
         embed.add_field(
             name=f"{card['name']} (ID: `{card_id}`)",
@@ -636,45 +736,40 @@ async def help_command(interaction: discord.Interaction):
     )
 
     embed.add_field(name="🎴 Card Commands", value="", inline=False)
-    card_commands = [
+    for cmd, desc in [
         ("k!card [category]", "Get a random card (anime, cartoon, kpop, kdrama, cdrama, jdrama, manhwa)"),
         ("k!c", "Alias for k!card"),
-    ]
-    for cmd, desc in card_commands:
+    ]:
         embed.add_field(name=cmd, value=desc, inline=False)
 
     embed.add_field(name="🔐 Lock/Unlock Commands", value="", inline=False)
-    lock_commands = [
+    for cmd, desc in [
         ("k!lock <card_id>", "Lock a card to prevent trading"),
         ("k!unlock <card_id>", "Unlock a card to allow trading"),
-    ]
-    for cmd, desc in lock_commands:
+    ]:
         embed.add_field(name=cmd, value=desc, inline=False)
 
     embed.add_field(name="💳 Trade Commands", value="", inline=False)
-    trade_commands = [
+    for cmd, desc in [
         ("k!tc @user <card_ids> [tokens]", "Offer a trade to another user"),
         ("k!accept_trade <trade_id>", "Accept a trade offer"),
-    ]
-    for cmd, desc in trade_commands:
+    ]:
         embed.add_field(name=cmd, value=desc, inline=False)
 
     embed.add_field(name="🏆 Auction Commands", value="", inline=False)
-    auction_commands = [
+    for cmd, desc in [
         ("k!as [category]", "Search for auctions"),
         ("k!ai <auction_id>", "Get auction details"),
         ("k!create_auction <starting_price> <card_ids>", "Create an auction"),
         ("k!bid <auction_id> <amount>", "Place a bid"),
-    ]
-    for cmd, desc in auction_commands:
+    ]:
         embed.add_field(name=cmd, value=desc, inline=False)
 
     embed.add_field(name="🪙 Token Commands", value="", inline=False)
-    token_commands = [
+    for cmd, desc in [
         ("k!token / k!t", "Check your token balance"),
         ("k!inv", "View your card inventory"),
-    ]
-    for cmd, desc in token_commands:
+    ]:
         embed.add_field(name=cmd, value=desc, inline=False)
 
     await interaction.response.send_message(embed=embed)
