@@ -5,6 +5,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 import random
+import json
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -100,6 +101,14 @@ CARD_CATEGORIES = {
     ],
 }
 
+# In-memory user data storage
+user_data = {}  # {user_id: {"cards": {card_id: {...}}, "tokens": int, "inventory": []}}
+card_counter = 1000  # Card ID counter
+locked_cards = set()  # Set of locked card IDs
+trade_offers = {}  # {offer_id: {"from_user": user_id, "to_user": user_id, "cards": [...], "tokens": amount}}
+auctions = {}  # {auction_id: {"owner": user_id, "cards": [...], "starting_price": amount, "current_bid": amount, "highest_bidder": user_id}}
+auction_counter = 1
+
 
 def normalize_category(value: str):
     cleaned = value.strip().lower().replace("-", " ").replace("_", " ")
@@ -118,6 +127,23 @@ def normalize_category(value: str):
         "j drama": "jdrama",
     }
     return aliases.get(cleaned, cleaned)
+
+
+def initialize_user(user_id):
+    """Initialize user data if not exists"""
+    if user_id not in user_data:
+        user_data[user_id] = {
+            "cards": {},
+            "tokens": 1000,  # Starting tokens
+            "inventory": [],
+        }
+
+
+def generate_card_id():
+    """Generate unique card ID"""
+    global card_counter
+    card_counter += 1
+    return card_counter
 
 
 class MyBot(commands.Bot):
@@ -144,6 +170,8 @@ async def on_ready():
 
 @bot.command(name="card", aliases=["c", "C"], help="Recommend a card from a category or choose a random one.")
 async def card(ctx, category: str = "random"):
+    initialize_user(ctx.author.id)
+
     if category.lower() == "random" or category.lower() == "r":
         selected_category = random.choice(list(CARD_CATEGORIES.keys()))
     else:
@@ -154,6 +182,19 @@ async def card(ctx, category: str = "random"):
             return
 
     card_name = random.choice(CARD_CATEGORIES[selected_category])
+    card_id = generate_card_id()
+
+    # Store card in user inventory
+    card_data = {
+        "id": card_id,
+        "name": card_name,
+        "category": selected_category,
+        "locked": False,
+        "obtained_at": datetime.now().isoformat(),
+    }
+
+    user_data[ctx.author.id]["cards"][card_id] = card_data
+    user_data[ctx.author.id]["inventory"].append(card_id)
 
     embed = discord.Embed(
         title=f"🎴 {selected_category.upper()} Card",
@@ -162,43 +203,414 @@ async def card(ctx, category: str = "random"):
         timestamp=datetime.now(),
     )
     embed.add_field(name="Category", value=selected_category.title(), inline=True)
-    embed.add_field(name="Mood", value="Great for a themed collection", inline=True)
+    embed.add_field(name="Card ID", value=f"`{card_id}`", inline=True)
+    embed.add_field(name="Status", value="🔓 Unlocked", inline=True)
     await ctx.send(embed=embed)
 
 
-@bot.command(name="anime", help="Get a random anime card suggestion")
-async def anime_card(ctx):
-    await card(ctx, "anime")
+# ==================== LOCK/UNLOCK COMMANDS ====================
+
+@bot.command(name="lock", help="Lock a card by ID to prevent trading")
+async def lock_card(ctx, card_id: int):
+    initialize_user(ctx.author.id)
+
+    if card_id not in user_data[ctx.author.id]["cards"]:
+        await ctx.send(f"❌ You don't own card ID `{card_id}`")
+        return
+
+    card = user_data[ctx.author.id]["cards"][card_id]
+
+    if card["locked"]:
+        await ctx.send(f"❌ Card ID `{card_id}` is already locked")
+        return
+
+    card["locked"] = True
+    locked_cards.add(card_id)
+
+    embed = discord.Embed(
+        title="🔒 Card Locked",
+        description=f"Card **{card['name']}** (ID: `{card_id}`) has been locked",
+        color=discord.Color.red(),
+    )
+    embed.add_field(name="Status", value="🔒 Locked - Cannot be traded", inline=False)
+    await ctx.send(embed=embed)
 
 
-@bot.command(name="cartoon", help="Get a random cartoon card suggestion")
-async def cartoon_card(ctx):
-    await card(ctx, "cartoon")
+@bot.command(name="unlock", help="Unlock a card by ID to allow trading")
+async def unlock_card(ctx, card_id: int):
+    initialize_user(ctx.author.id)
+
+    if card_id not in user_data[ctx.author.id]["cards"]:
+        await ctx.send(f"❌ You don't own card ID `{card_id}`")
+        return
+
+    card = user_data[ctx.author.id]["cards"][card_id]
+
+    if not card["locked"]:
+        await ctx.send(f"❌ Card ID `{card_id}` is already unlocked")
+        return
+
+    card["locked"] = False
+    locked_cards.discard(card_id)
+
+    embed = discord.Embed(
+        title="🔓 Card Unlocked",
+        description=f"Card **{card['name']}** (ID: `{card_id}`) has been unlocked",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="Status", value="🔓 Unlocked - Can be traded", inline=False)
+    await ctx.send(embed=embed)
 
 
-@bot.command(name="kpop", help="Get a random K-pop card suggestion")
-async def kpop_card(ctx):
-    await card(ctx, "kpop")
+# ==================== TRADE CARD COMMANDS ====================
+
+@bot.command(name="tc", aliases=["tradecard", "trade"], help="Trade card(s) with another user")
+async def trade_card(ctx, target_user: discord.Member, *, details: str = None):
+    initialize_user(ctx.author.id)
+    initialize_user(target_user.id)
+
+    if target_user == ctx.author:
+        await ctx.send("❌ You cannot trade with yourself")
+        return
+
+    if details is None:
+        # Show trade info format
+        embed = discord.Embed(
+            title="💳 Trade Card Command",
+            description="Usage: `k!tc @user card_id1, card_id2 [tokens]`",
+            color=discord.Color.blue(),
+        )
+        embed.add_field(
+            name="Example",
+            value="`k!tc @user 1001, 1002 100`\n(Trade cards 1001 and 1002 + 100 tokens to @user)",
+            inline=False,
+        )
+        embed.add_field(
+            name="Note",
+            value="Locked cards cannot be traded. Use `k!unlock card_id` to unlock.",
+            inline=False,
+        )
+        await ctx.send(embed=embed)
+        return
+
+    # Parse trade details
+    parts = details.split()
+    card_ids_str = parts[0]
+    tokens_amount = 0
+
+    if len(parts) > 1:
+        try:
+            tokens_amount = int(parts[-1])
+        except ValueError:
+            pass
+
+    try:
+        card_ids = [int(cid.strip(",")) for cid in card_ids_str.split(",")]
+    except ValueError:
+        await ctx.send("❌ Invalid card ID format. Use: `k!tc @user 1001, 1002`")
+        return
+
+    # Validate cards
+    for cid in card_ids:
+        if cid not in user_data[ctx.author.id]["cards"]:
+            await ctx.send(f"❌ You don't own card ID `{cid}`")
+            return
+
+        card = user_data[ctx.author.id]["cards"][cid]
+        if card["locked"]:
+            await ctx.send(f"❌ Card ID `{cid}` is locked and cannot be traded. Use `k!unlock {cid}` first.")
+            return
+
+    # Validate tokens
+    if tokens_amount > user_data[ctx.author.id]["tokens"]:
+        await ctx.send(f"❌ You only have {user_data[ctx.author.id]['tokens']} tokens")
+        return
+
+    # Create trade offer
+    trade_id = len(trade_offers)
+    trade_offers[trade_id] = {
+        "from_user": ctx.author.id,
+        "to_user": target_user.id,
+        "cards": card_ids,
+        "tokens": tokens_amount,
+        "status": "pending",
+    }
+
+    embed = discord.Embed(
+        title="💳 Trade Offer Created",
+        description=f"{ctx.author.mention} wants to trade with {target_user.mention}",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="Trade ID", value=f"`{trade_id}`", inline=False)
+    embed.add_field(name="Cards Offered", value=", ".join([f"`{cid}`" for cid in card_ids]), inline=False)
+    embed.add_field(name="Tokens", value=f"{tokens_amount} 🪙", inline=False)
+    embed.add_field(name="Command to Accept", value=f"`k!accept_trade {trade_id}`", inline=False)
+    await ctx.send(embed=embed)
 
 
-@bot.command(name="kdrama", help="Get a random K-drama card suggestion")
-async def kdrama_card(ctx):
-    await card(ctx, "kdrama")
+@bot.command(name="accept_trade", help="Accept a trade offer")
+async def accept_trade(ctx, trade_id: int):
+    initialize_user(ctx.author.id)
+
+    if trade_id not in trade_offers:
+        await ctx.send(f"❌ Trade ID `{trade_id}` not found")
+        return
+
+    trade = trade_offers[trade_id]
+
+    if trade["to_user"] != ctx.author.id:
+        await ctx.send("❌ This trade offer is not for you")
+        return
+
+    # Execute trade
+    from_user_id = trade["from_user"]
+    to_user_id = trade["to_user"]
+
+    # Transfer cards
+    for card_id in trade["cards"]:
+        card = user_data[from_user_id]["cards"].pop(card_id)
+        user_data[to_user_id]["cards"][card_id] = card
+        user_data[from_user_id]["inventory"].remove(card_id)
+        user_data[to_user_id]["inventory"].append(card_id)
+
+    # Transfer tokens
+    user_data[from_user_id]["tokens"] -= trade["tokens"]
+    user_data[to_user_id]["tokens"] += trade["tokens"]
+
+    trade["status"] = "completed"
+
+    embed = discord.Embed(
+        title="✅ Trade Completed",
+        description="Trade offer has been accepted and executed",
+        color=discord.Color.green(),
+    )
+    await ctx.send(embed=embed)
 
 
-@bot.command(name="cdrama", help="Get a random C-drama card suggestion")
-async def cdrama_card(ctx):
-    await card(ctx, "cdrama")
+# ==================== AUCTION COMMANDS ====================
+
+@bot.command(name="as", aliases=["auctionsearch"], help="Search for auctions with specific cards")
+async def auction_search(ctx, *, category: str = "all"):
+    initialize_user(ctx.author.id)
+
+    if not auctions:
+        await ctx.send("❌ No active auctions available")
+        return
+
+    embed = discord.Embed(
+        title="🏆 Auction Search",
+        description=f"Searching auctions for: **{category}**",
+        color=discord.Color.purple(),
+        timestamp=datetime.now(),
+    )
+
+    auction_count = 0
+    for auction_id, auction in auctions.items():
+        if category.lower() == "all" or any(normalize_category(category) == card.get("category") for card in auction["cards"]):
+            card_names = ", ".join([card["name"] for card in auction["cards"]])
+            embed.add_field(
+                name=f"Auction #{auction_id}",
+                value=f"Cards: {card_names}\nStarting Price: {auction['starting_price']} 🪙\nCurrent Bid: {auction['current_bid']} 🪙",
+                inline=False,
+            )
+            auction_count += 1
+
+    if auction_count == 0:
+        await ctx.send(f"❌ No auctions found for category: {category}")
+        return
+
+    embed.set_footer(text=f"Use k!ai <auction_id> for more details")
+    await ctx.send(embed=embed)
 
 
-@bot.command(name="jdrama", help="Get a random J-drama card suggestion")
-async def jdrama_card(ctx):
-    await card(ctx, "jdrama")
+@bot.command(name="ai", aliases=["auctioninfo"], help="Get detailed info about an auction")
+async def auction_info(ctx, auction_id: int):
+    initialize_user(ctx.author.id)
+
+    if auction_id not in auctions:
+        await ctx.send(f"❌ Auction ID `{auction_id}` not found")
+        return
+
+    auction = auctions[auction_id]
+
+    embed = discord.Embed(
+        title=f"🏆 Auction #{auction_id} Details",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(),
+    )
+
+    card_names = "\n".join([f"• {card['name']} (ID: `{card['id']}`)" for card in auction["cards"]])
+    embed.add_field(name="Cards in Auction", value=card_names, inline=False)
+    embed.add_field(name="Starting Price", value=f"{auction['starting_price']} 🪙", inline=True)
+    embed.add_field(name="Current Bid", value=f"{auction['current_bid']} 🪙", inline=True)
+
+    if auction["highest_bidder"]:
+        highest_bidder = await bot.fetch_user(auction["highest_bidder"])
+        embed.add_field(name="Highest Bidder", value=highest_bidder.mention, inline=False)
+
+    embed.add_field(name="Place a Bid", value=f"Use `k!bid {auction_id} <amount>`", inline=False)
+    await ctx.send(embed=embed)
 
 
-@bot.command(name="manhwa", help="Get a random manhwa card suggestion")
-async def manhwa_card(ctx):
-    await card(ctx, "manhwa")
+@bot.command(name="create_auction", help="Create an auction for your cards")
+async def create_auction(ctx, starting_price: int, *, card_ids_str: str):
+    initialize_user(ctx.author.id)
+
+    if starting_price < 1:
+        await ctx.send("❌ Starting price must be at least 1 token")
+        return
+
+    try:
+        card_ids = [int(cid.strip(",")) for cid in card_ids_str.split(",")]
+    except ValueError:
+        await ctx.send("❌ Invalid card ID format")
+        return
+
+    cards = []
+    for card_id in card_ids:
+        if card_id not in user_data[ctx.author.id]["cards"]:
+            await ctx.send(f"❌ You don't own card ID `{card_id}`")
+            return
+
+        card = user_data[ctx.author.id]["cards"][card_id]
+        if card["locked"]:
+            await ctx.send(f"❌ Card ID `{card_id}` is locked")
+            return
+
+        cards.append(card)
+
+    global auction_counter
+    auction_id = auction_counter
+    auction_counter += 1
+
+    auctions[auction_id] = {
+        "owner": ctx.author.id,
+        "cards": cards,
+        "starting_price": starting_price,
+        "current_bid": starting_price,
+        "highest_bidder": None,
+    }
+
+    # Remove cards from user inventory
+    for card_id in card_ids:
+        user_data[ctx.author.id]["cards"].pop(card_id)
+        user_data[ctx.author.id]["inventory"].remove(card_id)
+
+    embed = discord.Embed(
+        title="🏆 Auction Created",
+        description=f"Auction #{auction_id} is now live",
+        color=discord.Color.green(),
+    )
+    card_names = "\n".join([f"• {card['name']}" for card in cards])
+    embed.add_field(name="Cards", value=card_names, inline=False)
+    embed.add_field(name="Starting Price", value=f"{starting_price} 🪙", inline=False)
+    embed.add_field(name="Bid Command", value=f"`k!bid {auction_id} <amount>`", inline=False)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="bid", help="Place a bid on an auction")
+async def place_bid(ctx, auction_id: int, bid_amount: int):
+    initialize_user(ctx.author.id)
+
+    if auction_id not in auctions:
+        await ctx.send(f"❌ Auction ID `{auction_id}` not found")
+        return
+
+    auction = auctions[auction_id]
+
+    if bid_amount <= auction["current_bid"]:
+        await ctx.send(f"❌ Bid must be higher than current bid ({auction['current_bid']} 🪙)")
+        return
+
+    if bid_amount > user_data[ctx.author.id]["tokens"]:
+        await ctx.send(f"❌ You only have {user_data[ctx.author.id]['tokens']} tokens")
+        return
+
+    auction["current_bid"] = bid_amount
+    auction["highest_bidder"] = ctx.author.id
+
+    embed = discord.Embed(
+        title=f"💰 Bid Placed on Auction #{auction_id}",
+        description=f"{ctx.author.mention} placed a bid of {bid_amount} 🪙",
+        color=discord.Color.gold(),
+    )
+    await ctx.send(embed=embed)
+
+
+# ==================== TOKEN COMMANDS ====================
+
+@bot.command(name="token", aliases=["t", "T"], help="Check your token balance")
+async def check_tokens(ctx):
+    initialize_user(ctx.author.id)
+
+    tokens = user_data[ctx.author.id]["tokens"]
+
+    embed = discord.Embed(
+        title="🪙 Token Balance",
+        description=f"{ctx.author.mention}'s Balance",
+        color=discord.Color.yellow(),
+    )
+    embed.add_field(name="Tokens", value=f"{tokens} 🪙", inline=True)
+    embed.add_field(name="Card Count", value=f"{len(user_data[ctx.author.id]['inventory'])} cards", inline=True)
+    await ctx.send(embed=embed)
+
+
+@bot.command(name="give_tokens", help="Admin command to give tokens to a user")
+async def give_tokens(ctx, user: discord.Member, amount: int):
+    # This is an admin-only command for testing
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("❌ Only administrators can use this command")
+        return
+
+    initialize_user(user.id)
+    user_data[user.id]["tokens"] += amount
+
+    embed = discord.Embed(
+        title="💰 Tokens Added",
+        description=f"{amount} 🪙 added to {user.mention}'s balance",
+        color=discord.Color.green(),
+    )
+    embed.add_field(name="New Balance", value=f"{user_data[user.id]['tokens']} 🪙", inline=False)
+    await ctx.send(embed=embed)
+
+
+# ==================== INVENTORY COMMAND ====================
+
+@bot.command(name="inv", aliases=["inventory"], help="View your card inventory")
+async def inventory(ctx, user: discord.Member = None):
+    target_user = user or ctx.author
+    initialize_user(target_user.id)
+
+    cards = user_data[target_user.id]["cards"]
+    tokens = user_data[target_user.id]["tokens"]
+
+    if not cards:
+        embed = discord.Embed(
+            title=f"📦 {target_user.name}'s Inventory",
+            description="No cards yet. Use `k!card` to get started!",
+            color=discord.Color.blue(),
+        )
+        await ctx.send(embed=embed)
+        return
+
+    embed = discord.Embed(
+        title=f"📦 {target_user.name}'s Inventory",
+        description=f"Total Cards: {len(cards)} | Tokens: {tokens} 🪙",
+        color=discord.Color.blue(),
+    )
+
+    for card_id, card in list(cards.items())[:10]:  # Show first 10 cards
+        lock_status = "🔒 Locked" if card["locked"] else "🔓 Unlocked"
+        embed.add_field(
+            name=f"{card['name']} (ID: `{card_id}`)",
+            value=f"Category: {card['category'].title()}\nStatus: {lock_status}",
+            inline=False,
+        )
+
+    if len(cards) > 10:
+        embed.set_footer(text=f"Showing 10 of {len(cards)} cards")
+
+    await ctx.send(embed=embed)
 
 
 # ==================== SLASH COMMANDS ====================
@@ -214,147 +626,55 @@ async def hello(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(f"Hello {user.mention}!")
 
 
-@bot.tree.command(name="userinfo", description="Get information about a user")
-@app_commands.describe(user="The user to get info about")
-async def userinfo(interaction: discord.Interaction, user: discord.Member = None):
-    target_user = user or interaction.user
-
-    embed = discord.Embed(
-        title=f"User Info - {target_user.name}",
-        color=discord.Color.blue(),
-        timestamp=datetime.now(),
-    )
-    embed.set_thumbnail(url=target_user.avatar.url if target_user.avatar else None)
-    embed.add_field(name="Username", value=target_user.name, inline=True)
-    embed.add_field(name="ID", value=target_user.id, inline=True)
-    embed.add_field(name="Account Created", value=target_user.created_at.strftime("%Y-%m-%d %H:%M:%S"), inline=False)
-    embed.add_field(name="Joined Server", value=target_user.joined_at.strftime("%Y-%m-%d %H:%M:%S") if target_user.joined_at else "Unknown", inline=False)
-    embed.add_field(name="Bot?", value="Yes" if target_user.bot else "No", inline=True)
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="roll", description="Roll a dice")
-@app_commands.describe(sides="Number of sides on the dice (default: 6)")
-async def roll(interaction: discord.Interaction, sides: int = 6):
-    if sides < 2:
-        await interaction.response.send_message("The dice must have at least 2 sides!")
-        return
-
-    result = random.randint(1, sides)
-    await interaction.response.send_message(f"🎲 Rolled a d{sides}: **{result}**")
-
-
-@bot.tree.command(name="choose", description="Let the bot choose between options")
-@app_commands.describe(options="Separate choices with commas (e.g., Pizza, Burger, Tacos)")
-async def choose(interaction: discord.Interaction, options: str):
-    choices = [choice.strip() for choice in options.split(",")]
-
-    if len(choices) < 2:
-        await interaction.response.send_message("Please provide at least 2 choices separated by commas!")
-        return
-
-    selected = random.choice(choices)
-    await interaction.response.send_message(f"🎯 I choose: **{selected}**")
-
-
-@bot.tree.command(name="serverinfo", description="Get information about the server")
-async def serverinfo(interaction: discord.Interaction):
-    guild = interaction.guild
-
-    embed = discord.Embed(
-        title=f"Server Info - {guild.name}",
-        color=discord.Color.green(),
-        timestamp=datetime.now(),
-    )
-    embed.set_thumbnail(url=guild.icon.url if guild.icon else None)
-    embed.add_field(name="Server ID", value=guild.id, inline=True)
-    embed.add_field(name="Owner", value=guild.owner.mention if guild.owner else "Unknown", inline=True)
-    embed.add_field(name="Members", value=guild.member_count, inline=True)
-    embed.add_field(name="Created", value=guild.created_at.strftime("%Y-%m-%d %H:%M:%S"), inline=False)
-    embed.add_field(name="Text Channels", value=len(guild.text_channels), inline=True)
-    embed.add_field(name="Voice Channels", value=len(guild.voice_channels), inline=True)
-
-    await interaction.response.send_message(embed=embed)
-
-
-@bot.tree.command(name="avatar", description="Get a user's avatar")
-@app_commands.describe(user="The user to get the avatar of")
-async def avatar(interaction: discord.Interaction, user: discord.Member = None):
-    target_user = user or interaction.user
-
-    if target_user.avatar:
-        embed = discord.Embed(
-            title=f"{target_user.name}'s Avatar",
-            color=discord.Color.purple(),
-            timestamp=datetime.now(),
-        )
-        embed.set_image(url=target_user.avatar.url)
-        embed.description = f"[Download]({target_user.avatar.url})"
-        await interaction.response.send_message(embed=embed)
-    else:
-        await interaction.response.send_message(f"{target_user.mention} is using the default avatar!")
-
-
-@bot.tree.command(name="echo", description="Repeat what you say")
-@app_commands.describe(message="What to echo")
-async def echo(interaction: discord.Interaction, message: str):
-    await interaction.response.send_message(f"```{message}```")
-
-
 @bot.tree.command(name="help", description="Get help with available commands")
 async def help_command(interaction: discord.Interaction):
     embed = discord.Embed(
         title="Bot Commands",
-        description="Here are all available commands:\n\n**Slash Commands** start with `/`\n**Prefix Commands** start with `k!`",
+        description="Here are all available commands:\n\n**Prefix:** `k!`",
         color=discord.Color.gold(),
         timestamp=datetime.now(),
     )
 
-    embed.add_field(name="📌 Slash Commands", value="", inline=False)
-    slash_commands = [
-        ("/ping", "Check if the bot is alive"),
-        ("/hello @user", "Greet a user"),
-        ("/userinfo [@user]", "Get information about a user"),
-        ("/roll [sides]", "Roll a dice (default: 6 sides)"),
-        ("/choose options", "Choose randomly from comma-separated options"),
-        ("/serverinfo", "Get information about the server"),
-        ("/avatar [@user]", "Get a user's avatar"),
-        ("/echo message", "Echo a message"),
-    ]
-
-    for cmd, desc in slash_commands:
-        embed.add_field(name=cmd, value=desc, inline=False)
-
-    embed.add_field(name="🎴 Card Commands (Prefix: k!)", value="", inline=False)
+    embed.add_field(name="🎴 Card Commands", value="", inline=False)
     card_commands = [
-        ("k!card", "Get a random card recommendation"),
-        ("k!card anime", "Get an anime card pick"),
-        ("k!card cartoon", "Get a cartoon card pick"),
-        ("k!card kpop", "Get a K-pop card pick"),
-        ("k!card kdrama", "Get a K-drama card pick"),
-        ("k!card cdrama", "Get a C-drama card pick"),
-        ("k!card jdrama", "Get a J-drama card pick"),
-        ("k!card manhwa", "Get a manhwa card pick"),
+        ("k!card [category]", "Get a random card (anime, cartoon, kpop, kdrama, cdrama, jdrama, manhwa)"),
         ("k!c", "Alias for k!card"),
     ]
-
     for cmd, desc in card_commands:
         embed.add_field(name=cmd, value=desc, inline=False)
 
-    embed.add_field(name="🛡️ Moderation Commands (Prefix: k!)", value="", inline=False)
-    mod_commands = [
-        ("k!kick @user [reason]", "Kick a user from the server"),
-        ("k!ban @user [reason]", "Ban a user from the server"),
-        ("k!unban user#tag", "Unban a user by tag (e.g., username#1234)"),
-        ("k!mute @user [duration]", "Mute a user for a duration (e.g., 10m, 1h, 1d)"),
-        ("k!unmute @user", "Unmute a user"),
-        ("k!warn @user [reason]", "Warn a user"),
-        ("k!warnings [@user]", "View warnings for a user or yourself"),
-        ("k!clear [amount]", "Delete messages (max 100, default 5)"),
+    embed.add_field(name="🔐 Lock/Unlock Commands", value="", inline=False)
+    lock_commands = [
+        ("k!lock <card_id>", "Lock a card to prevent trading"),
+        ("k!unlock <card_id>", "Unlock a card to allow trading"),
     ]
+    for cmd, desc in lock_commands:
+        embed.add_field(name=cmd, value=desc, inline=False)
 
-    for cmd, desc in mod_commands:
+    embed.add_field(name="💳 Trade Commands", value="", inline=False)
+    trade_commands = [
+        ("k!tc @user <card_ids> [tokens]", "Offer a trade to another user"),
+        ("k!accept_trade <trade_id>", "Accept a trade offer"),
+    ]
+    for cmd, desc in trade_commands:
+        embed.add_field(name=cmd, value=desc, inline=False)
+
+    embed.add_field(name="🏆 Auction Commands", value="", inline=False)
+    auction_commands = [
+        ("k!as [category]", "Search for auctions"),
+        ("k!ai <auction_id>", "Get auction details"),
+        ("k!create_auction <starting_price> <card_ids>", "Create an auction"),
+        ("k!bid <auction_id> <amount>", "Place a bid"),
+    ]
+    for cmd, desc in auction_commands:
+        embed.add_field(name=cmd, value=desc, inline=False)
+
+    embed.add_field(name="🪙 Token Commands", value="", inline=False)
+    token_commands = [
+        ("k!token / k!t", "Check your token balance"),
+        ("k!inv", "View your card inventory"),
+    ]
+    for cmd, desc in token_commands:
         embed.add_field(name=cmd, value=desc, inline=False)
 
     await interaction.response.send_message(embed=embed)
